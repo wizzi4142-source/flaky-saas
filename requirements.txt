@@ -1,0 +1,9 @@
+flask>=3.0
+requests>=2.31
+pyjwt>=2.8
+cryptography>=42.0
+# Hosting-only packages. The markers keep a local `pip install -r` from
+# failing on Windows / very new Python versions; local runs use SQLite and
+# need neither of them.
+gunicorn>=22.0; sys_platform != "win32"
+psycopg[binary]>=3.1; python_version < "3.14"

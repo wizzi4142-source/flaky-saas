@@ -16,7 +16,14 @@ Configuration (environment variables):
     GITHUB_APP_PRIVATE_KEY_PATH  path to the .pem file (for local use)
     DATABASE_URL               Postgres connection string; if unset, a local
                                SQLite file (FLAKY_DB_PATH) is used instead
-    DASHBOARD_KEY              optional; if set, /dashboard/... requires ?key=<this>
+    DASHBOARD_KEY              optional legacy bypass; if set, appending
+                               ?key=<this> skips the login requirement
+    SECRET_KEY                 required for login — signs the session cookie
+    GITHUB_APP_CLIENT_ID       required for login — from the app's About page
+    GITHUB_APP_CLIENT_SECRET   required for login — "Generate a new client secret"
+    APP_BASE_URL               this service's own public URL, e.g.
+                               https://flaky-saas.onrender.com (needed to build
+                               the OAuth callback URL)
 
 Local run:   python webhook_server.py
 Hosting:     gunicorn webhook_server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
@@ -26,9 +33,10 @@ import hashlib
 import hmac
 import html
 import os
+import secrets
 import threading
 
-from flask import Flask, Response, abort, request
+from flask import Flask, Response, abort, redirect, request, session, url_for
 
 from analyze import analyze as _analyze
 from analyze import load_rows as _load_rows
@@ -44,14 +52,28 @@ from collector import (
 )
 from db import connect
 from github_app_auth import get_installation_token
+from github_oauth import (
+    build_authorize_url,
+    exchange_code_for_token,
+    get_accessible_repos,
+    get_user_login,
+)
 from report import build_html as _build_html
 
 APP_ID = os.environ.get("GITHUB_APP_ID")
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 DB_PATH = os.environ.get("FLAKY_DB_PATH", "flaky_saas.db")
 DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "")
+CLIENT_ID = os.environ.get("GITHUB_APP_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("GITHUB_APP_CLIENT_SECRET", "")
+BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 
 app = Flask(__name__)
+# SECRET_KEY signs the session cookie (login state). Without a stable one,
+# every restart would log everyone out; a random fallback is fine for local
+# testing but MUST be set explicitly when hosting with more than one worker.
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 
 def load_private_key() -> bytes:
@@ -133,13 +155,99 @@ def healthz():
     return {"status": "ok"}, 200
 
 
+def _login_configured() -> bool:
+    return bool(CLIENT_ID and CLIENT_SECRET and BASE_URL)
+
+
+def _current_user_repos():
+    """None if not logged in; otherwise the list of repos (possibly empty)
+    this session's user is allowed to see, as cached at login time."""
+    return session.get("repos")
+
+
+@app.route("/login", methods=["GET"])
+def login():
+    if not _login_configured():
+        abort(500, description="login is not configured (missing GITHUB_APP_CLIENT_ID/SECRET/APP_BASE_URL)")
+    state = secrets.token_urlsafe(24)
+    session["oauth_state"] = state
+    redirect_uri = f"{BASE_URL}/callback"
+    return redirect(build_authorize_url(CLIENT_ID, redirect_uri, state))
+
+
+@app.route("/callback", methods=["GET"])
+def callback():
+    if request.args.get("state") != session.pop("oauth_state", None):
+        abort(400, description="invalid OAuth state — please try logging in again")
+    code = request.args.get("code")
+    if not code:
+        abort(400, description="missing code from GitHub")
+
+    user_token = exchange_code_for_token(CLIENT_ID, CLIENT_SECRET, code)
+    session["user_login"] = get_user_login(user_token)
+    session["repos"] = get_accessible_repos(user_token)
+    return redirect(url_for("home"))
+
+
+@app.route("/logout", methods=["GET"])
+def logout():
+    session.clear()
+    return redirect(url_for("home"))
+
+
+@app.route("/", methods=["GET"])
+def home():
+    if not _login_configured():
+        return (
+            "<p style='font-family:sans-serif'>Login isn't configured on this "
+            "deployment yet — set GITHUB_APP_CLIENT_ID, GITHUB_APP_CLIENT_SECRET "
+            "and APP_BASE_URL.</p>",
+            200,
+        )
+
+    repos = _current_user_repos()
+    if repos is None:
+        return (
+            "<p style='font-family:sans-serif'>"
+            "<a href='/login'>Sign in with GitHub</a> to see your repos' "
+            "flaky-test dashboards.</p>",
+            200,
+        )
+
+    who = html.escape(session.get("user_login", ""))
+    if not repos:
+        body = "<p>No repos found — install the GitHub App on a repo first.</p>"
+    else:
+        items = "".join(
+            f"<li><a href='/dashboard/{html.escape(r)}'>{html.escape(r)}</a></li>"
+            for r in sorted(repos)
+        )
+        body = f"<ul>{items}</ul>"
+
+    return (
+        f"<div style='font-family:sans-serif'>"
+        f"<p>Signed in as <b>{who}</b> — <a href='/logout'>sign out</a></p>"
+        f"{body}"
+        f"</div>",
+        200,
+    )
+
+
 @app.route("/dashboard/<owner>/<repo>", methods=["GET"])
 def dashboard(owner: str, repo: str):
-    """Live HTML dashboard for one repo, read straight from the database."""
-    if DASHBOARD_KEY and not hmac.compare_digest(request.args.get("key", ""), DASHBOARD_KEY):
-        abort(403, description="missing or wrong ?key=")
-
+    """Live HTML dashboard for one repo, read straight from the database.
+    Access is granted either by a valid login session that includes this
+    repo, or (legacy / scripting) by the shared DASHBOARD_KEY."""
     repo_full_name = f"{owner}/{repo}"
+
+    key_ok = bool(DASHBOARD_KEY) and hmac.compare_digest(request.args.get("key", ""), DASHBOARD_KEY)
+    if not key_ok:
+        repos = _current_user_repos()
+        if repos is None:
+            return redirect(url_for("login") if _login_configured() else url_for("home"))
+        if repo_full_name not in repos:
+            abort(403, description="you don't have access to this repo")
+
     with open_db() as conn:
         rows = _load_rows(conn, repo_full_name)
     if not rows:
